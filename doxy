@@ -19,20 +19,47 @@
 ################################################################################
 
 # This program takes the name of a docker image (ex: rodneyxr/web1) and links
-# it to the proxy container. If the container is deployed successfully then the
-# proxy will be configured to forward any requests on the subdomain to the
-# container. The proxy will then be restarted so that changes can take effect.
+# it to the doxy container. If the container is deployed successfully then Doxy
+# will be configured to forward any requests on the subdomain to the container.
+# Doxy will then be restarted so that changes can take effect.
 #
-# Usage: doxy <image_name> <sub.domain.com>
+# Usage: doxy <image> <hostname>
 #
 # Author: Rodney Rodriguez
 
 my $nargs = $#ARGV + 1;
 
 # Check arguments
-if ($nargs != 2) {
-    print STDERR "Usage: doxy <image_name> <hostname>\n";
-    exit;
+if ($nargs == 0) {
+    print_usage();
+} elsif ($nargs == 1) {
+    $arg = shift;
+    if ($arg eq 'start') {
+        doxy_start();
+        exit;
+    } elsif ($arg eq 'stop') {
+        doxy_stop();
+        exit;
+    } elsif ($arg eq 'shutdown') {
+        doxy_shutdown();
+        exit;
+    } elsif ($arg eq 'restart') {
+        doxy_restart(); 
+        exit;
+    } elsif ($arg eq 'status') {
+        doxy_status();
+        exit;
+    } else {
+        print_usage();
+    }
+} elsif ($nargs == 3) {
+    $arg1 = shift;
+    if ($arg1 eq 'deploy') {
+    } else {
+        print_usage();
+    }
+} else {
+    print_usage();
 }
 
 my $image = shift;
@@ -42,33 +69,30 @@ my ($subdomain, $domain) = $hostname =~ /([^\.]*)\.(.*)/;
 # Check if the image exists locally
 if (!`docker images -q $image`) {
     # the image does not exist here
-    print "Image '$image' does not exists locally.\n";
+    print "Image '$image' does not exist locally.\n";
     print "Attempting to pull...\n";
 
     if (!`docker pull $image | grep '^Digest:'`) {
         exit; # failed to pull the image
     } else {
-        print "Successfully downloaded the image '$image'\n";
+        print "Successfully downloaded '$image'\n";
     }
 }
 
 # Image exists locally at this point
-# cmd: docker run --name <subdomain> -d --link proxy:proxy <image_name>
+# cmd: docker run --name <subdomain> -d --link doxy:doxy <image>
 
-# Ensure that there is a continer named proxy. Stopped or running is okay.
-$running = `docker inspect -f {{.State.Running}} proxy 2> /dev/null`;
-if ($running eq '') {
-    print STDERR "There is no container named 'proxy'. Please start it and run this script again.\n";
-    exit;
-}
-if ($running eq "false\n") {
-    print "** Please note that 'proxy' is not currently running.\n";
+# Ensure that there is a continer named doxy. Stopped or running is okay.
+if (!is_deployed('doxy')) {
+    print "Doxy has not been deployed yet.\n";
+    doxy_start();
+} elsif (!is_running('doxy')) {
+    print "** Please note that 'doxy' is not currently running.\n";
 }
 
-# There is a container named proxy at this point
+# There is a container named doxy at this point
 # Ensure that the subdomain is not currently in use
-$running = `docker inspect -f {{.State.Running}} $subdomain 2> /dev/null`;
-if ($running ne '') {
+if (is_deployed($subdomain)) {
     # container conflict will occur here
     print STDERR "The name '$subdomain' is already in use by another container.\n";
     exit;
@@ -76,14 +100,9 @@ if ($running ne '') {
 
 # Run the container
 print "Running $subdomain...\n";
-`docker run --name $subdomain -d --link proxy:proxy $image`;
+`docker run --name $subdomain -d --link doxy:doxy $image`;
 
-$ipaddr = `docker inspect --format '{{ .NetworkSettings.IPAddress }}' $subdomain 2> /dev/null`;
-if ($ipaddr eq '') {
-    print STDERR "Error: Failed to run $subdomain\n";
-    exit;
-}
-chop $ipaddr; # remove the new line
+$ipaddr = get_ip_address($subdomain);
 
 # Generate the nginx config file
 my $config = << "END_CONFIG";
@@ -104,11 +123,130 @@ server {
 END_CONFIG
 
 # Open the config file for write
-open(CONFIG_FILE, "> proxy/conf.d/$subdomain.conf") or
-die "Error: Failed to open proxy/conf.d/$subdomain.conf: $!";
+open(CONFIG_FILE, "> /etc/doxy/conf.d/$subdomain.conf") or
+die "Error: Failed to open /etc/doxy/conf.d/$subdomain.conf: $!";
 print CONFIG_FILE $config;
 close CONFIG_FILE;
 
-# Restart the proxy for changes to the effect
-print "Restarting proxy...\n";
-`docker restart proxy`;
+# Restart Doxy for changes to the effect
+doxy_restart();
+
+# subroutines
+
+sub print_usage {
+    print STDOUT "Usage: doxy COMMAND [arg...]\n";
+    print STDOUT "\n";
+    print STDOUT "Commands:\n";
+    print STDOUT "    start     Start the Doxy container\n";
+    print STDOUT "    stop      Stop the Doxy container\n";
+    print STDOUT "    restart   Restart the Doxy container\n";
+    print STDOUT "    shutdown  Stop and remove the Doxy container from Docker\n";
+    print STDOUT "    status    Check if Doxy is deployed and running\n";
+    print STDOUT "    deploy    Deploy and link a Docker container to Doxy\n";
+    print STDOUT "\n";
+    print STDOUT "RUN 'doxy deploy <repo/image_name> <sub.domain.com>' to deploy a container.\n";
+    exit;
+}
+
+sub doxy_start {
+    $deployed = is_deployed('doxy');
+    $running = is_running('doxy');
+    if ($running) {
+        print "Doxy is already running\n";
+        return;
+    }
+    if ($deployed) {
+        print "Starting Doxy...\n";
+        `docker start doxy`;
+    } else {
+        print "Starting Doxy...\n";
+        `docker run --name doxy -d -p 80:80 -p 443:443 -v /etc/doxy/conf.d:/etc/nginx/conf.d nginx`
+    }
+}
+
+sub doxy_stop {
+    $deployed = is_deployed('doxy');
+    $running = is_running('doxy');
+    if (!$deployed) {
+        print "Doxy is not deployed\n";
+    } elsif ($running) {
+        print "Stopping Doxy...\n";
+        `docker stop doxy`;
+    } else {
+        print "Doxy is already stopped\n";
+    }
+}
+
+sub doxy_restart {
+    $deployed = is_deployed('doxy');
+    $running = is_running('doxy');
+    if (!$deployed) {
+        print "Doxy is not deployed\n";
+    } elsif ($running) {
+        print "Restarting Doxy...\n";
+        `docker restart doxy`;
+    } else {
+        print "Doxy is not running\n";
+    }
+}
+
+sub doxy_shutdown {
+    $deployed = is_deployed('doxy');
+    $running = is_running('doxy');
+    if (!$deployed) {
+        print "Doxy is not deployed\n";
+        return;
+    } elsif ($running) {
+        doxy_stop();
+    }
+    print "Removing Doxy container...\n";
+    `docker rm doxy`;
+}
+
+sub doxy_status {
+    $deployed = is_deployed('doxy');
+    $running = is_running('doxy');
+    if (!$deployed) {
+        print "Not Deployed\n";
+    } elsif ($running) {
+        print "Running\n";
+    } else {
+        print "Stopped\n";
+    }
+}
+
+# @params
+#   container : string
+# @return
+#   empty string if container is not deployed; false otherwise
+sub is_deployed {
+    $container = shift;
+    $running = `docker inspect -f {{.State.Running}} $container 2> /dev/null`;
+    chop $running;
+    return $running;
+}
+
+# @params 
+#   container : string
+# @return
+#   0 if not running; 1 if running
+sub is_running {
+    $running = is_deployed(shift);
+    return 0 unless $running eq "true";
+}
+
+# @params 
+#   container : string
+# @return
+#   the IP address of the container or exits if it fails
+sub get_ip_address {
+    $subdomain = shift;
+    $ipaddr = `docker inspect --format '{{ .NetworkSettings.IPAddress }}' $subdomain 2> /dev/null`;
+    if ($ipaddr eq '') {
+        print STDERR "Error: Failed to get IP for $subdomain\n";
+        exit;
+    }
+    chop $ipaddr; # remove the new line
+    return $ipaddr;
+}
+
